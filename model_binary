@@ -1,0 +1,180 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 26 16:58:20 2021
+
+@author: A
+"""
+
+import torch.nn.functional as F
+from argparse import ArgumentParser, Namespace
+import torch.nn as nn
+import torch
+DEVICES = torch.device('cuda')
+
+from torch.optim import lr_scheduler
+import json
+from torch_geometric.nn import GCNConv,GATConv, global_max_pool as gmp
+
+from torch.nn.modules.container import ModuleList
+# from torch_geometric.nn import (GATConv,
+#                                 SAGPooling,
+#                                 LayerNorm,
+#                                 global_mean_pool,
+#                                 max_pool_neighbor_x,
+#                                 global_add_pool)
+
+
+
+# GCN based model
+class DDI(torch.nn.Module):
+    def __init__(self, drug_feature, num_features_xd=78, out_dim=64, dropoutc=0.1):
+
+        super(DDI, self).__init__()
+
+        self.feature = drug_feature
+        self.out_dim = out_dim
+
+        
+#        self.initial_norm = LayerNorm(self.drug_feature)    ###对所有的分子特征进行归一化
+
+        # SMILES graph branch
+        self.conv1 = GCNConv(num_features_xd, num_features_xd)  # 定义第一层图卷积78*78
+        self.conv2= GCNConv(num_features_xd, num_features_xd*2) # 定义第二层图卷积78*156
+        self.conv3= GATConv(num_features_xd*2, num_features_xd*4,heads=1, dropout= 0.1) # 定义第二层图卷积78*156
+
+        # self.conv3 = GCNConv(num_features_xd*2, num_features_xd * 4) # 定义第三层图卷积156*312
+        # self.fc_g1= torch.nn.Linear(num_features_xd*4, 1024)  # 定义平滑处理药物嵌入特征的全连接层1，312*1024
+        self.fc_g1= torch.nn.Linear(num_features_xd*4, 128)  # 定义平滑处理药物嵌入特征的全连接层1，312*1024
+
+        self.fc_g2 = torch.nn.Linear(128, self.out_dim*2)   #定义平滑处理药物嵌入特征的全连接层2，1024
+        self.relu = nn.ReLU()
+        self.dropoutc = nn.Dropout(dropoutc)
+        decoder_module = decoder_deep(self.out_dim)
+        # decoder_module = decoder_inner_product()
+        # decoder_module = decoder_matrix_decom()
+        self.add_module('decoder', decoder_module)   ##无参数
+
+
+    def forward(self, data,regress=True):
+        #print(data)
+        #print(data0)
+        # get graph input
+        #x1, edge_index1, x2, edge_index2, batch = data.x, data.edge_index,data.x2.x, data.x2.edge_index, data.batch
+        # get protein input
+        
+        h_data, t_data = data
+        x1, edge_index1, batch1= h_data['x'], h_data['edge_index'] ,h_data['batch']
+        x2, edge_index2, batch2= t_data['x'], t_data['edge_index'] ,t_data['batch']
+
+#        h_data.x = self.initial_norm(h_data.x, h_data.batch)
+#        t_data.x = self.initial_norm(t_data.x, t_data.batch)
+
+        x1 = x1.float().cuda()
+        x1 = self.conv1(x1, edge_index1)
+        x1 = self.relu(x1)
+        x1 = self.conv2(x1, edge_index1)
+        x1 = self.relu(x1)
+        x1 = self.conv3(x1, edge_index1)
+        x1 = self.relu(x1)
+        x1 = gmp(x1, batch1)
+        #print(x1.size)
+        #x1 = gmp(x1, len(data))       # global max pooling
+
+        # flattenv
+        x1 = self.relu(self.fc_g1(x1))
+        x1 = self.dropoutc(x1)
+        #print(x1.size())
+        x1 = self.fc_g2(x1)
+        x1 = self.relu(x1)
+        ####对第二个药物的结构特征进行学习
+        x2 = x2.float().cuda()
+        x2 = self.conv1(x2, edge_index2)
+        x2 = self.relu(x2)
+        x2 = self.conv2(x2, edge_index2)
+        x2 = self.relu(x2)
+        x2 = self.conv3(x2, edge_index2)
+        x2 = self.relu(x2)
+        x2 = gmp(x2, batch2)
+        #print(x1.size)
+        #x1 = gmp(x1, len(data))       # global max pooling
+
+        # flattenv
+        x2 = self.relu(self.fc_g1(x2))
+        x2 = self.dropoutc(x2)
+        #print(x1.size())
+        x2 = self.fc_g2(x2)
+        x2 = self.relu(x2)
+        pred_score = self.decoder(x1,x2)
+        return pred_score
+
+
+class decoder_deep(nn.Module):
+    def __init__(self, EMBEDDING_SIZE):
+        super(decoder_deep, self).__init__()
+        self.dim = EMBEDDING_SIZE
+        self.out_linear_layer1 = torch.nn.Linear(self.dim*4, 64)
+        self.out_linear_layer2 = torch.nn.Linear(64, 64)
+        self.out_linear_layer3 = torch.nn.Linear(64, 64)
+        self.out_linear_layer4 = torch.nn.Linear(64, 2)
+
+        self.relu = nn.ReLU()
+
+        self.d = nn.Parameter(torch.FloatTensor(self.dim, self.dim ))
+        self.r = nn.Parameter(torch.FloatTensor(self.dim, self.dim))
+
+        nn.init.kaiming_normal_(self.d.data)
+
+    def forward(self, emb1,emb2):
+        # emb11 = torch.Tensor(emb1)#.to(DEVICES)
+        # emb22 = torch.Tensor(emb2)#.to(DEVICES)
+        #
+        # emb11 = torch.Tensor(emb1).reshape((1,self.dim*2))#.to(DEVICES)
+        # emb22 = torch.Tensor(emb2).reshape((1,self.dim*2))#.to(DEVICES)
+        #new_embeddings = self.out_linear_layer(self.features(n2))
+
+        #out_score =  torch.FloatTensor(1).to(DEVICES)
+        #inter = torch.mm(emb11, self.d)
+        #out_score = F.sigmoid(torch.mm(inter,emb22.T))
+        ##EDET framwork
+
+        # inter = torch.einsum("ij,jl->il", [emb1.to(DEVICES), self.d.to(DEVICES)])
+        out_score = torch.mul(emb1.to(DEVICES), emb2.to(DEVICES))
+        out_score = torch.sigmoid(out_score.sum(dim=1).unsqueeze(dim=1))
+        #
+
+        # out_score = [F.sigmoid(torch.dot(inter[i], emb2[i])) for i in range(len(emb2))]  #F.leaky_relu
+
+        #DNN framwork
+
+        # edge = torch.cat((emb1.to(DEVICES),emb2.to(DEVICES)), dim=1)
+        # out = self.relu(self.out_linear_layer1(edge))
+        #out = self.relu(self.out_linear_layer2(out))
+        #out = self.relu(self.out_linear_layer3(out))
+        #print(out)
+        # out_score = torch.sigmoid(self.out_linear_layer4(out))
+        # out_score = self.out_linear_layer4(out)
+        #print(out_score)
+
+        # return out_score.data.cpu()
+        return out_score
+
+    #new_embeddings = self.out_linear_layer(self.features(n2))
+
+    #original_node_edge = np.array([self.unique_nodes_dict[nodes], self.unique_nodes_dict[nodes]]).T
+    #edges = np.vstack((edges, original_node_edge))
+
+    #edges = torch.LongTensor(edges).to(DEVICES)
+
+    #edge_h_2 = torch.cat((new_embeddings[edges[:, 0], :], new_embeddings[edges[:, 1], :]), dim=1)
+
+    #edges_h = torch.exp(F.leaky_relu(torch.einsum("ij,jl->il", [edge_h_2, self.a]), self.slope_ratio))
+    #indices = edges
+
+    #matrix = torch.sparse_coo_tensor(indices.t(), edges_h[:, 0], \
+     #                                torch.Size([batch_node_num, batch_node_num]), device=DEVICES)
+    #row_sum = torch.sparse.mm(matrix, torch.ones(size=(batch_node_num, 1)).to(DEVICES))
+
+    #results = torch.sparse.mm(matrix, new_embeddings)
+
+    #
+    #output_emb = results.div(row_sum)
